@@ -6,28 +6,31 @@ import { linea, baseSepolia, sepolia, type Chain } from 'viem/chains';
 export const PAYE_ABI = parseAbi([
   // Read
   'function owner() view returns (address)',
+  'function pendingOwner() view returns (address)',
   'function developer() view returns (address)',
   'function developerEnabled() view returns (bool)',
   'function pendingDeveloper() view returns (address)',
   // Write (owner only)
+  'function transferOwnership(address newOwner) external',
+  'function renounceOwnership() external',
   'function setDeveloper(address newDeveloper) external',
   'function enableDeveloper() external',
   'function disableDeveloper() external',
+  // Write (pending owner only)
+  'function acceptOwnership() external',
   // Write (pending developer only)
   'function acceptDeveloper() external',
 ]);
 
 // ── Chain config ──────────────────────────────────────────────────────────────
 
-export type TokenEnv = 'main' | 'dev';
-
 export interface EvmChainConfig {
   chain: Chain;
   label: string;
-  /** Prefix used in env var names, e.g. 'LINEA' → VITE_LINEA_CONTRACT_MAIN */
+  /** Env var prefix, e.g. 'LINEA' → VITE_LINEA_CONTRACT */
   envPrefix: string;
   rpcUrl: string;
-  contracts: Record<TokenEnv, string>;
+  contractAddress: string;
 }
 
 export const EVM_CHAINS: EvmChainConfig[] = [
@@ -36,29 +39,20 @@ export const EVM_CHAINS: EvmChainConfig[] = [
     label: 'Linea Mainnet',
     envPrefix: 'LINEA',
     rpcUrl: (import.meta.env.VITE_LINEA_RPC_URL as string | undefined) ?? 'https://rpc.linea.build',
-    contracts: {
-      main: (import.meta.env.VITE_LINEA_CONTRACT_MAIN as string | undefined) ?? '',
-      dev:  (import.meta.env.VITE_LINEA_CONTRACT_DEV  as string | undefined) ?? '',
-    },
+    contractAddress: (import.meta.env.VITE_LINEA_CONTRACT as string | undefined) ?? '',
   },
   {
     chain: baseSepolia,
     label: 'Base Sepolia',
     envPrefix: 'BASE_SEPOLIA',
     rpcUrl: (import.meta.env.VITE_BASE_SEPOLIA_RPC_URL as string | undefined) ?? 'https://sepolia.base.org',
-    contracts: {
-      main: (import.meta.env.VITE_BASE_SEPOLIA_CONTRACT_MAIN as string | undefined) ?? '',
-      dev:  (import.meta.env.VITE_BASE_SEPOLIA_CONTRACT_DEV  as string | undefined) ?? '',
-    },
+    contractAddress: (import.meta.env.VITE_BASE_SEPOLIA_CONTRACT as string | undefined) ?? '',
   },
   {
     chain: sepolia,
     label: 'Eth Sepolia',
     envPrefix: 'ETH_SEPOLIA',
     rpcUrl: (import.meta.env.VITE_ETH_SEPOLIA_RPC_URL as string | undefined) ?? 'https://rpc.sepolia.org',
-    contracts: {
-      main: (import.meta.env.VITE_ETH_SEPOLIA_CONTRACT_MAIN as string | undefined) ?? '',
-      dev:  (import.meta.env.VITE_ETH_SEPOLIA_CONTRACT_DEV  as string | undefined) ?? '',
-    },
+    contractAddress: (import.meta.env.VITE_ETH_SEPOLIA_CONTRACT as string | undefined) ?? '',
   },
 ];

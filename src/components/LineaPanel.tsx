@@ -1,14 +1,14 @@
 import { useState, useEffect, useCallback } from 'react';
-import { useAccount, useWalletClient } from 'wagmi';
-import { ConnectButton } from '@rainbow-me/rainbowkit';
+import { useAccount, useWalletClient, useChainId, useSwitchChain } from 'wagmi';
 import { isAddress, zeroAddress, createPublicClient, http, type Address } from 'viem';
-import { EVM_CHAINS, PAYE_ABI, type TokenEnv } from '../config/evm';
+import { EVM_CHAINS, PAYE_ABI } from '../config/evm';
 import AddressInput from './AddressInput';
 import StatusBadge from './StatusBadge';
 import TxStatus from './TxStatus';
 
 interface ContractState {
   owner: Address;
+  pendingOwner: Address;
   developer: Address;
   developerEnabled: boolean;
   pendingDeveloper: Address;
@@ -16,7 +16,7 @@ interface ContractState {
 
 export default function LineaPanel() {
   const [chainIdx, setChainIdx] = useState(0);
-  const [tokenEnv, setTokenEnv] = useState<TokenEnv>('main');
+  const [newOwnerAddress, setNewOwnerAddress] = useState('');
   const [newDevAddress, setNewDevAddress] = useState('');
   const [contractState, setContractState] = useState<ContractState | null>(null);
   const [isFetching, setIsFetching] = useState(false);
@@ -28,11 +28,14 @@ export default function LineaPanel() {
 
   const { address: account, isConnected } = useAccount();
   const { data: walletClient } = useWalletClient();
+  const connectedChainId = useChainId();
+  const { switchChain, isPending: isSwitching } = useSwitchChain();
 
   const chainCfg = EVM_CHAINS[chainIdx];
-  const contractAddress = chainCfg.contracts[tokenEnv];
+  const contractAddress = chainCfg.contractAddress;
   const rpcUrl = chainCfg.rpcUrl;
   const validAddress = isAddress(contractAddress) ? (contractAddress as Address) : undefined;
+  const isWrongChain = isConnected && connectedChainId !== chainCfg.chain.id;
 
   // ── Read — viem public client, any chain ────────────────────────────────────
 
@@ -41,13 +44,14 @@ export default function LineaPanel() {
     setIsFetching(true);
     try {
       const client = createPublicClient({ transport: http(rpcUrl) });
-      const [owner, developer, developerEnabled, pendingDeveloper] = await Promise.all([
+      const [owner, pendingOwner, developer, developerEnabled, pendingDeveloper] = await Promise.all([
         client.readContract({ address: validAddress, abi: PAYE_ABI, functionName: 'owner' }),
+        client.readContract({ address: validAddress, abi: PAYE_ABI, functionName: 'pendingOwner' }),
         client.readContract({ address: validAddress, abi: PAYE_ABI, functionName: 'developer' }),
         client.readContract({ address: validAddress, abi: PAYE_ABI, functionName: 'developerEnabled' }),
         client.readContract({ address: validAddress, abi: PAYE_ABI, functionName: 'pendingDeveloper' }),
       ]);
-      setContractState({ owner, developer, developerEnabled, pendingDeveloper });
+      setContractState({ owner, pendingOwner, developer, developerEnabled, pendingDeveloper });
     } catch (e) {
       setContractState(null);
       setTxState({ state: 'error', msg: `Read failed: ${(e as Error).message}` });
@@ -99,6 +103,36 @@ export default function LineaPanel() {
     );
   }
 
+  function handleTransferOwnership() {
+    if (!isAddress(newOwnerAddress)) { alert('Enter a valid Ethereum address.'); return; }
+    if (newOwnerAddress.toLowerCase() === contractState?.owner.toLowerCase()) {
+      setTxState({ state: 'error', msg: 'This address is already the owner.' });
+      return;
+    }
+    void runWrite('Transfer Ownership', () =>
+      walletClient!.writeContract({
+        address: validAddress!,
+        abi: PAYE_ABI,
+        functionName: 'transferOwnership',
+        args: [newOwnerAddress as Address],
+      }),
+    );
+  }
+
+  function handleRenounceOwnership() {
+    if (!window.confirm(
+      'Renounce ownership?\n\nThis permanently removes the owner address and CANNOT be undone. The contract will have no owner.',
+    )) return;
+    void runWrite('Renounce Ownership', () =>
+      walletClient!.writeContract({ address: validAddress!, abi: PAYE_ABI, functionName: 'renounceOwnership' }),
+    );
+  }
+
+  const handleAcceptOwnership = () =>
+    void runWrite('Accept Ownership', () =>
+      walletClient!.writeContract({ address: validAddress!, abi: PAYE_ABI, functionName: 'acceptOwnership' }),
+    );
+
   const handleAcceptDeveloper = () =>
     void runWrite('Accept Developer', () =>
       walletClient!.writeContract({ address: validAddress!, abi: PAYE_ABI, functionName: 'acceptDeveloper' }),
@@ -120,6 +154,12 @@ export default function LineaPanel() {
     !!account && !!contractState?.owner &&
     account.toLowerCase() === contractState.owner.toLowerCase();
 
+  const isPendingOwner =
+    !!account &&
+    !!contractState?.pendingOwner &&
+    contractState.pendingOwner !== zeroAddress &&
+    account.toLowerCase() === contractState.pendingOwner.toLowerCase();
+
   const isPendingDev =
     !!account &&
     !!contractState?.pendingDeveloper &&
@@ -134,64 +174,27 @@ export default function LineaPanel() {
     setTxState({ state: 'idle', msg: '' });
   }
 
-  function selectToken(t: TokenEnv) {
-    setTokenEnv(t);
-    setContractState(null);
-    setTxState({ state: 'idle', msg: '' });
-  }
-
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
     <div className="space-y-6">
 
-      {/* ── Network + Token selectors ─────────────────────────────────────── */}
-      <div className="flex flex-wrap gap-4 items-end">
-        {/* Chain tabs */}
-        <div className="flex-1 min-w-0">
-          <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">
-            Network
-          </label>
-          <div className="flex gap-1 bg-gray-800 rounded-xl p-1">
-            {EVM_CHAINS.map((c, i) => (
-              <button
-                key={c.chain.id}
-                onClick={() => selectChain(i)}
-                className={`flex-1 px-3 py-1.5 rounded-lg text-sm font-semibold transition-all whitespace-nowrap ${
-                  chainIdx === i
-                    ? 'bg-blue-600 text-white shadow'
-                    : 'text-gray-400 hover:text-gray-200'
-                }`}
-              >
-                {c.label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* Token env toggle */}
-        <div>
-          <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">
-            Token
-          </label>
-          <div className="flex gap-1 bg-gray-800 rounded-xl p-1">
-            {(['main', 'dev'] as TokenEnv[]).map((t) => (
-              <button
-                key={t}
-                onClick={() => selectToken(t)}
-                className={`px-5 py-1.5 rounded-lg text-sm font-semibold transition-all ${
-                  tokenEnv === t
-                    ? t === 'main'
-                      ? 'bg-blue-600 text-white shadow'
-                      : 'bg-orange-600 text-white shadow'
-                    : 'text-gray-400 hover:text-gray-200'
-                }`}
-              >
-                {t === 'main' ? 'Main' : 'Dev'}
-              </button>
-            ))}
-          </div>
-        </div>
+      {/* ── Network dropdown ───────────────────────────────────────────────── */}
+      <div>
+        <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">
+          Network
+        </label>
+        <select
+          value={chainIdx}
+          onChange={(e) => selectChain(Number(e.target.value))}
+          className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 focus:outline-none focus:border-blue-500"
+        >
+          {EVM_CHAINS.map((c, i) => (
+            <option key={c.chain.id} value={i}>
+              {c.label}
+            </option>
+          ))}
+        </select>
       </div>
 
       {/* ── Contract address banner ───────────────────────────────────────── */}
@@ -202,20 +205,17 @@ export default function LineaPanel() {
         </div>
       ) : (
         <div className="px-3 py-2 bg-yellow-900/30 border border-yellow-700/50 rounded-lg text-xs text-yellow-400">
-          No contract configured for{' '}
-          <strong>{chainCfg.label} / {tokenEnv === 'main' ? 'Main' : 'Dev'}</strong>.{' '}
+          No contract configured for <strong>{chainCfg.label}</strong>.{' '}
           Set{' '}
           <code className="bg-yellow-900/50 px-1 rounded">
-            VITE_{chainCfg.envPrefix}_CONTRACT_{tokenEnv.toUpperCase()}
+            VITE_{chainCfg.envPrefix}_CONTRACT
           </code>{' '}
           in your <code className="bg-yellow-900/50 px-1 rounded">.env</code>.
         </div>
       )}
 
-      {/* ── Wallet + Refresh ─────────────────────────────────────────────── */}
+      {/* ── Refresh ──────────────────────────────────────────────────────── */}
       <div className="flex items-center gap-3 flex-wrap">
-        <ConnectButton chainStatus="icon" accountStatus="avatar" showBalance={false} />
-
         <button
           onClick={() => void readState()}
           disabled={!validAddress || isFetching}
@@ -225,19 +225,24 @@ export default function LineaPanel() {
         </button>
 
         {isConnected && (
-          <div className="flex gap-2">
-            {isOwner && (
-              <span className="px-2 py-0.5 bg-blue-900 text-blue-300 border border-blue-700 rounded text-xs font-semibold">
-                Owner
-              </span>
-            )}
-            {isPendingDev && (
-              <span className="px-2 py-0.5 bg-yellow-900 text-yellow-300 border border-yellow-700 rounded text-xs font-semibold">
-                Pending Developer
-              </span>
-            )}
-          </div>
-        )}
+            <div className="flex gap-2">
+              {isOwner && (
+                <span className="px-2 py-0.5 bg-blue-900 text-blue-300 border border-blue-700 rounded text-xs font-semibold">
+                  Owner
+                </span>
+              )}
+              {isPendingOwner && (
+                <span className="px-2 py-0.5 bg-indigo-900 text-indigo-300 border border-indigo-700 rounded text-xs font-semibold">
+                  Pending Owner
+                </span>
+              )}
+              {isPendingDev && (
+                <span className="px-2 py-0.5 bg-yellow-900 text-yellow-300 border border-yellow-700 rounded text-xs font-semibold">
+                  Pending Developer
+                </span>
+              )}
+            </div>
+          )}
       </div>
 
       {/* ── Current state ─────────────────────────────────────────────────── */}
@@ -247,6 +252,9 @@ export default function LineaPanel() {
             Current State
           </h3>
           <StateRow label="Owner" value={contractState.owner} />
+          {contractState.pendingOwner !== zeroAddress && (
+            <StateRow label="Pending Owner" value={contractState.pendingOwner} highlight />
+          )}
           <StateRow label="Developer" value={contractState.developer} />
           <div className="flex items-center justify-between py-2 border-b border-gray-700">
             <span className="text-sm text-gray-400">Developer Enabled</span>
@@ -258,8 +266,25 @@ export default function LineaPanel() {
         </div>
       )}
 
+      {/* ── Wrong chain warning ───────────────────────────────────────────── */}
+      {isConnected && isWrongChain && (
+        <div className="flex items-center justify-between gap-3 px-4 py-3 bg-yellow-900/30 border border-yellow-700/50 rounded-xl">
+          <div className="text-sm text-yellow-300">
+            Wallet is on a different network. Switch to{' '}
+            <strong>{chainCfg.label}</strong> to sign transactions.
+          </div>
+          <button
+            onClick={() => switchChain({ chainId: chainCfg.chain.id })}
+            disabled={isSwitching}
+            className="shrink-0 px-4 py-2 bg-yellow-600 hover:bg-yellow-500 rounded-lg text-sm font-semibold transition disabled:opacity-50"
+          >
+            {isSwitching ? 'Switching…' : `Switch to ${chainCfg.label}`}
+          </button>
+        </div>
+      )}
+
       {/* ── Write actions ─────────────────────────────────────────────────── */}
-      {isConnected && validAddress && (
+      {isConnected && validAddress && !isWrongChain && (
         <div className="space-y-4">
           <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wide">
             Actions{' '}
@@ -269,6 +294,52 @@ export default function LineaPanel() {
               </span>
             )}
           </h3>
+
+          {isOwner && (
+            <div className="bg-gray-800 rounded-xl p-4 space-y-3">
+              <p className="text-sm font-medium text-gray-200">Ownership</p>
+
+              <p className="text-xs text-gray-500">
+                Propose a new owner (two-step). The address must call{' '}
+                <em>Accept Ownership</em> to take effect. The current owner retains control until
+                then.
+              </p>
+              <AddressInput
+                placeholder="New owner address (0x…)"
+                value={newOwnerAddress}
+                onChange={setNewOwnerAddress}
+              />
+              <ActionButton onClick={handleTransferOwnership} label="Transfer Ownership" busy={isBusy} />
+
+              <hr className="border-gray-700" />
+
+              <p className="text-xs text-gray-500">
+                Permanently removes the owner. No further owner-gated actions will be possible.{' '}
+                <strong className="text-red-400">This cannot be undone.</strong>
+              </p>
+              <ActionButton
+                onClick={handleRenounceOwnership}
+                label="Renounce Ownership"
+                busy={isBusy}
+                variant="danger"
+              />
+            </div>
+          )}
+
+          {isPendingOwner && (
+            <div className="bg-indigo-900/30 border border-indigo-700/50 rounded-xl p-4 space-y-3">
+              <p className="text-sm font-medium text-indigo-200">Accept Ownership</p>
+              <p className="text-xs text-indigo-400">
+                Your wallet is the pending owner. Sign to complete the ownership transfer.
+              </p>
+              <ActionButton
+                onClick={handleAcceptOwnership}
+                label="Accept Ownership"
+                busy={isBusy}
+                variant="primary"
+              />
+            </div>
+          )}
 
           {isOwner && (
             <div className="bg-gray-800 rounded-xl p-4 space-y-3">

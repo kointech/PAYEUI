@@ -1,7 +1,7 @@
 import { Buffer } from 'buffer';
 (window as unknown as Record<string, unknown>).Buffer = Buffer;
 
-import React from 'react';
+import React, { useState } from 'react';
 import ReactDOM from 'react-dom/client';
 
 // ── Wagmi / RainbowKit (EVM) ──────────────────────────────────────────────────
@@ -21,10 +21,11 @@ const ConnectionProvider = _ConnectionProvider as React.ComponentType<
 >;
 import { WalletModalProvider } from '@solana/wallet-adapter-react-ui';
 import { PhantomWalletAdapter, SolflareWalletAdapter } from '@solana/wallet-adapter-wallets';
-import { clusterApiUrl } from '@solana/web3.js';
 import '@solana/wallet-adapter-react-ui/styles.css';
 
 import { wagmiConfig } from './config/wagmi';
+import { SOLANA_CLUSTERS } from './config/solana';
+import { SolanaEndpointContext } from './config/SolanaEndpointContext';
 import App from './App';
 import './index.css';
 
@@ -35,24 +36,30 @@ const queryClient = new QueryClient();
 // in SolanaPanel will list them automatically.
 const solanaWallets = [new PhantomWalletAdapter(), new SolflareWalletAdapter()];
 
+const MAINNET_CFG = SOLANA_CLUSTERS.find((c) => c.id === 'mainnet')!;
+
+function SolanaProviders({ children }: { children: React.ReactNode }) {
+  const [endpoint, setEndpoint] = useState(MAINNET_CFG.rpcUrl);
+  return (
+    <SolanaEndpointContext.Provider value={setEndpoint}>
+      <ConnectionProvider endpoint={endpoint}>
+        <WalletProvider wallets={solanaWallets} autoConnect>
+          <WalletModalProvider>{children}</WalletModalProvider>
+        </WalletProvider>
+      </ConnectionProvider>
+    </SolanaEndpointContext.Provider>
+  );
+}
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
-    {/* EVM providers */}
-    <WagmiProvider config={wagmiConfig}>
-      <QueryClientProvider client={queryClient}>
-        <RainbowKitProvider theme={darkTheme()}>
-          {/* Solana providers — ConnectionProvider endpoint is mainnet-beta by default;
-              SolanaPanel creates its own Connection for devnet reads/writes. */}
-          <ConnectionProvider endpoint={clusterApiUrl('mainnet-beta')}>
-            <WalletProvider wallets={solanaWallets} autoConnect>
-              <WalletModalProvider>
-                <App />
-              </WalletModalProvider>
-            </WalletProvider>
-          </ConnectionProvider>
-        </RainbowKitProvider>
-      </QueryClientProvider>
-    </WagmiProvider>
-  </React.StrictMode>,
+  <WagmiProvider config={wagmiConfig}>
+    <QueryClientProvider client={queryClient}>
+      <RainbowKitProvider theme={darkTheme()}>
+        <SolanaProviders>
+          <App />
+        </SolanaProviders>
+      </RainbowKitProvider>
+    </QueryClientProvider>
+  </WagmiProvider>,
 );
 

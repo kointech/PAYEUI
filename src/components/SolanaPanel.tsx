@@ -1,221 +1,262 @@
-import { useState, useCallback } from 'react';
-import { Connection, PublicKey, Transaction } from '@solana/web3.js';
+import { useState, useEffect, useCallback, useContext, useRef } from 'react';
+import { Connection, PublicKey, Transaction, SendTransactionError } from '@solana/web3.js';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
 import {
   fetchOFTStore,
+  buildSetAdminIx,
+  buildAcceptAdminIx,
   buildSetDeveloperIx,
   buildSetDeveloperEnabledIx,
   OFTStoreInfo,
-  SOLANA_MAINNET_RPC,
-  SOLANA_DEVNET_RPC,
 } from '../utils/solana';
+import { SOLANA_CLUSTERS } from '../config/solana';
+import { SolanaEndpointContext } from '../config/SolanaEndpointContext';
 import AddressInput from './AddressInput';
 import StatusBadge from './StatusBadge';
 import TxStatus from './TxStatus';
 
-type Cluster = 'mainnet' | 'devnet';
-
 const NULL_PUBKEY = '11111111111111111111111111111111';
 
 export default function SolanaPanel() {
-  // ── Wallet adapter ─────────────────────────────────────────────────────────
-  const { publicKey, sendTransaction, connected } = useWallet();
+  const { publicKey, signTransaction, connected } = useWallet();
+  const setEndpoint = useContext(SolanaEndpointContext);
 
-  // ── Local state ───────────────────────────────────────────────────────────
-  const [cluster, setCluster] = useState<Cluster>('mainnet');
-  const [programId, setProgramId] = useState('');
-  const [oftStoreAddress, setOftStoreAddress] = useState('');
+  const mainnetIdx = SOLANA_CLUSTERS.findIndex((c) => c.id === 'mainnet');
+  const [clusterIdx, setClusterIdx] = useState(mainnetIdx);
   const [storeInfo, setStoreInfo] = useState<OFTStoreInfo | null>(null);
   const [loading, setLoading] = useState(false);
+  const [newAdminAddress, setNewAdminAddress] = useState('');
   const [newDevAddress, setNewDevAddress] = useState('');
   const [txStatus, setTxStatus] = useState<{
     state: 'idle' | 'pending' | 'success' | 'error';
     msg: string;
-  }>({ state: 'idle', msg: '' });
+    card: 'admin' | 'set' | 'toggle' | null;
+  }>({ state: 'idle', msg: '', card: null });
+  const [stateFlash, setStateFlash] = useState(false);
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clusterCfg = SOLANA_CLUSTERS[clusterIdx];
+  const { rpcUrl, programId, oftStore } = clusterCfg;
+  const isConfigured = !!programId && !!oftStore;
 
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   function getConnection() {
-    return new Connection(
-      cluster === 'mainnet' ? SOLANA_MAINNET_RPC : SOLANA_DEVNET_RPC,
-      'confirmed',
-    );
+    return new Connection(rpcUrl, 'confirmed');
   }
 
-  function parseProgramId(): PublicKey {
-    try {
-      return new PublicKey(programId);
-    } catch {
-      throw new Error('Invalid Program ID.');
-    }
+  function getProgramId(): PublicKey {
+    return new PublicKey(programId);
   }
 
-  function parseOftStore(): PublicKey {
-    try {
-      return new PublicKey(oftStoreAddress);
-    } catch {
-      throw new Error('Invalid OFT Store address.');
-    }
+  function getOftStore(): PublicKey {
+    return new PublicKey(oftStore);
   }
 
-  // ── Read state ─────────────────────────────────────────────────────────────
+  // ── Read ───────────────────────────────────────────────────────────────────
 
-  const readState = useCallback(async () => {
+  const readState = useCallback(async (flash = false) => {
+    if (!isConfigured) return;
     setLoading(true);
     try {
-      const connection = getConnection();
-      const oft = parseOftStore();
-      const info = await fetchOFTStore(connection, oft);
+      const info = await fetchOFTStore(getConnection(), getOftStore());
       setStoreInfo(info);
+      if (flash) {
+        setStateFlash(true);
+        if (flashTimer.current) clearTimeout(flashTimer.current);
+        flashTimer.current = setTimeout(() => setStateFlash(false), 1800);
+      }
     } catch (e) {
-      alert(`Read failed: ${(e as Error).message}`);
+      setStoreInfo(null);
+      setTxStatus({ state: 'error', msg: `Read failed: ${(e as Error).message}`, card: null });
     } finally {
       setLoading(false);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cluster, oftStoreAddress]);
+  }, [clusterIdx]);
 
-  // ── Write helpers ──────────────────────────────────────────────────────────
+  // Auto-read on cluster change
+  useEffect(() => {
+    setStoreInfo(null);
+    setTxStatus({ state: 'idle', msg: '', card: null });
+    if (isConfigured) void readState();
+  }, [clusterIdx, isConfigured, readState]);
+
+  // ── Write ──────────────────────────────────────────────────────────────────
 
   async function runWrite(
     label: string,
+    card: 'admin' | 'set' | 'toggle',
     buildIx: () => Promise<import('@solana/web3.js').TransactionInstruction>,
   ) {
-    if (!publicKey) {
-      alert('Connect your Solana wallet first.');
-      return;
-    }
-    setTxStatus({ state: 'pending', msg: `${label} — waiting for signature…` });
+    if (!publicKey || !signTransaction) { alert('Connect your Solana wallet first.'); return; }
+    setTxStatus({ state: 'pending', msg: `${label} — waiting for signature…`, card });
     try {
       const connection = getConnection();
       const ix = await buildIx();
       const { blockhash, lastValidBlockHeight } =
         await connection.getLatestBlockhash('confirmed');
-      const tx = new Transaction({ feePayer: publicKey, blockhash, lastValidBlockHeight }).add(
-        ix,
-      );
-      const sig = await sendTransaction(tx, connection);
-      setTxStatus({ state: 'pending', msg: `Confirming… (${sig.slice(0, 16)}…)` });
-      await connection.confirmTransaction(
-        { signature: sig, blockhash, lastValidBlockHeight },
-        'confirmed',
-      );
-      setTxStatus({ state: 'success', msg: `${label} confirmed. Sig: ${sig.slice(0, 16)}…` });
-      await readState();
+      const tx = new Transaction({ feePayer: publicKey, blockhash, lastValidBlockHeight }).add(ix);
+      // Use signTransaction + sendRawTransaction so the app's connection (devnet/mainnet)
+      // is used for sending, rather than Phantom's internal RPC via SolanaSignAndSendTransaction.
+      const signed = await signTransaction(tx);
+      const sig = await connection.sendRawTransaction(signed.serialize(), { skipPreflight: false });
+      setTxStatus({ state: 'pending', msg: `Confirming… (${sig.slice(0, 16)}…)`, card });
+      await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
+      setTxStatus({ state: 'success', msg: `${label} confirmed. Sig: ${sig.slice(0, 16)}…`, card });
+      if (card === 'set') setNewDevAddress('');
+      if (card === 'admin') setNewAdminAddress('');
+      await readState(true);
     } catch (e) {
-      setTxStatus({ state: 'error', msg: `${label} failed: ${(e as Error).message}` });
+      if (e instanceof SendTransactionError) {
+        // "already been processed" means the identical tx was confirmed on a prior attempt
+        // (Ed25519 is deterministic: same blockhash + instruction + key → same signature).
+        // Treat it as a success and refresh state.
+        if (e.message.includes('already been processed')) {
+          setTxStatus({ state: 'success', msg: `${label} was already confirmed on-chain.`, card });
+          if (card === 'set') setNewDevAddress('');
+          if (card === 'admin') setNewAdminAddress('');
+          await readState(true);
+          return;
+        }
+        const connection = getConnection();
+        const logs = await e.getLogs(connection).catch(() => null);
+        const logText = logs?.length ? `\nLogs:\n${logs.join('\n')}` : '';
+        setTxStatus({ state: 'error', msg: `${label} failed: ${e.message}${logText}`, card });
+      } else {
+        setTxStatus({ state: 'error', msg: `${label} failed: ${(e as Error).message}`, card });
+      }
     }
   }
 
-  // ── Action handlers ────────────────────────────────────────────────────────
+  async function handleSetAdmin() {
+    let newAdmin: PublicKey;
+    try { newAdmin = new PublicKey(newAdminAddress); }
+    catch { alert('Enter a valid Solana public key.'); return; }
+    if (storeInfo && newAdmin.equals(storeInfo.admin)) {
+      setTxStatus({ state: 'error', msg: 'This address is already the current admin.', card: 'admin' });
+      return;
+    }
+    await runWrite('Transfer Admin', 'admin', () =>
+      buildSetAdminIx(publicKey!, getOftStore(), newAdmin, getProgramId()),
+    );
+  }
+
+  async function handleAcceptAdmin() {
+    await runWrite('Accept Admin', 'admin', () =>
+      buildAcceptAdminIx(publicKey!, getOftStore(), getProgramId()),
+    );
+  }
 
   async function handleSetDeveloper() {
     let newDev: PublicKey;
-    try {
-      newDev = new PublicKey(newDevAddress);
-    } catch {
-      alert('Enter a valid Solana public key for the new developer.');
+    try { newDev = new PublicKey(newDevAddress); }
+    catch { alert('Enter a valid Solana public key.'); return; }
+    if (storeInfo && newDev.equals(storeInfo.developer)) {
+      setTxStatus({ state: 'error', msg: 'This address is already the current developer.', card: 'set' });
       return;
     }
-    await runWrite('Set Developer', async () =>
-      buildSetDeveloperIx(publicKey!, parseOftStore(), newDev, parseProgramId()),
+    await runWrite('Set Developer', 'set', () =>
+      buildSetDeveloperIx(publicKey!, getOftStore(), newDev, getProgramId()),
     );
   }
 
-  async function handleEnableDeveloper() {
-    await runWrite('Enable Developer', async () =>
-      buildSetDeveloperEnabledIx(publicKey!, parseOftStore(), true, parseProgramId()),
+  const handleEnableDeveloper = () =>
+    runWrite('Enable Developer', 'toggle', () =>
+      buildSetDeveloperEnabledIx(publicKey!, getOftStore(), true, getProgramId()),
     );
-  }
 
-  async function handleDisableDeveloper() {
-    await runWrite('Disable Developer', async () =>
-      buildSetDeveloperEnabledIx(publicKey!, parseOftStore(), false, parseProgramId()),
+  const handleDisableDeveloper = () =>
+    runWrite('Disable Developer', 'toggle', () =>
+      buildSetDeveloperEnabledIx(publicKey!, getOftStore(), false, getProgramId()),
     );
-  }
-
-  // ── Role detection ─────────────────────────────────────────────────────────
 
   const isAdmin =
     !!publicKey && !!storeInfo && storeInfo.admin.toBase58() === publicKey.toBase58();
+
+  const isPendingAdmin =
+    !!publicKey && !!storeInfo?.pendingAdmin &&
+    storeInfo.pendingAdmin.toBase58() === publicKey.toBase58();
+
+  function selectCluster(idx: number) {
+    setClusterIdx(idx);
+    setEndpoint(SOLANA_CLUSTERS[idx].rpcUrl);
+    setStoreInfo(null);
+    setTxStatus({ state: 'idle', msg: '', card: null });
+  }
+
+  // Detect cluster label for the connected wallet hint
+  const expectedClusterLabel = clusterCfg.label; // 'Mainnet' | 'Devnet'
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <div className="space-y-6">
-      {/* Cluster selector */}
+
+      {/* ── Cluster dropdown ───────────────────────────────────────────────── */}
       <div>
-        <label className="block text-sm font-medium text-gray-400 mb-1">Cluster</label>
-        <div className="flex gap-2">
-          {(['mainnet', 'devnet'] as Cluster[]).map((c) => (
-            <button
-              key={c}
-              onClick={() => {
-                setCluster(c);
-                setStoreInfo(null);
-              }}
-              className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${
-                cluster === c
-                  ? 'bg-purple-700 text-white'
-                  : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
-              }`}
-            >
-              {c === 'mainnet' ? 'Mainnet' : 'Devnet'}
-            </button>
+        <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1.5">
+          Cluster
+        </label>
+        <select
+          value={clusterIdx}
+          onChange={(e) => selectCluster(Number(e.target.value))}
+          className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 focus:outline-none focus:border-purple-500"
+        >
+          {SOLANA_CLUSTERS.map((c, i) => (
+            <option key={c.id} value={i}>
+              {c.label}
+            </option>
           ))}
+        </select>
+      </div>
+
+      {/* ── Cluster mismatch warning ───────────────────────────────────────── */}
+      {connected && (
+        <div className="flex items-start gap-3 px-4 py-3 bg-yellow-900/30 border border-yellow-700/50 rounded-xl">
+          <span className="text-yellow-400 text-lg leading-none shrink-0">⚠</span>
+          <div className="text-sm text-yellow-300">
+            Ensure your Solana wallet is set to{' '}
+            <strong>{expectedClusterLabel}</strong>.
+            <span className="block text-xs text-yellow-500 mt-0.5">
+              Open your wallet (e.g. Phantom → Settings → Change Network) and select{' '}
+              <strong>{expectedClusterLabel}</strong> to match this cluster.
+            </span>
+          </div>
         </div>
-      </div>
+      )}
 
-      {/* Program ID */}
-      <div>
-        <label className="block text-sm font-medium text-gray-400 mb-1">
-          PAYE OFT Program ID
-        </label>
-        <input
-          type="text"
-          className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-purple-500"
-          placeholder="Program public key (base58)"
-          value={programId}
-          maxLength={44}
-          onChange={(e) => setProgramId(e.target.value.trim())}
-          spellCheck={false}
-        />
-      </div>
-
-      {/* OFT Store address */}
-      <div>
-        <label className="block text-sm font-medium text-gray-400 mb-1">
-          OFT Store Address (PDA)
-        </label>
-        <input
-          type="text"
-          className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm font-mono focus:outline-none focus:border-purple-500"
-          placeholder="OFT Store PDA (base58) — from deployments/solana-*.json"
-          value={oftStoreAddress}
-          maxLength={44}
-          onChange={(e) => setOftStoreAddress(e.target.value.trim())}
-          spellCheck={false}
-        />
-        <p className="text-xs text-gray-600 mt-1">
-          Found in{' '}
-          <code className="bg-gray-800 px-1 rounded">
-            deployments/solana-{cluster}.json
+      {/* ── Config banners ─────────────────────────────────────────────────── */}
+      {isConfigured ? (
+        <div className="space-y-2">
+          <ConfigBanner label="Program ID" value={programId} />
+          <ConfigBanner label="OFT Store" value={oftStore} />
+        </div>
+      ) : (
+        <div className="px-3 py-2 bg-yellow-900/30 border border-yellow-700/50 rounded-lg text-xs text-yellow-400">
+          No addresses configured for <strong>{clusterCfg.label}</strong>. Set{' '}
+          <code className="bg-yellow-900/50 px-1 rounded">
+            VITE_SOLANA_{clusterCfg.id.toUpperCase()}_PROGRAM_ID
           </code>{' '}
-          → <code className="bg-gray-800 px-1 rounded">oftStore</code>
-        </p>
-      </div>
+          and{' '}
+          <code className="bg-yellow-900/50 px-1 rounded">
+            VITE_SOLANA_{clusterCfg.id.toUpperCase()}_OFT_STORE
+          </code>{' '}
+          in your <code className="bg-yellow-900/50 px-1 rounded">.env</code>.
+        </div>
+      )}
 
-      {/* Wallet — wallet-adapter WalletMultiButton + role badge + read button */}
+      {/* ── Wallet + Refresh ─────────────────────────────────────────────── */}
       <div className="flex items-center gap-3 flex-wrap">
         <WalletMultiButton style={{ height: '38px', fontSize: '14px', borderRadius: '8px' }} />
 
         <button
-          onClick={readState}
-          disabled={loading || !oftStoreAddress}
+          onClick={() => void readState()}
+          disabled={loading || !isConfigured}
           className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm font-semibold transition disabled:opacity-50"
         >
-          {loading ? 'Reading…' : 'Read State'}
+          {loading ? 'Reading…' : 'Refresh'}
         </button>
 
         {connected && isAdmin && (
@@ -223,15 +264,24 @@ export default function SolanaPanel() {
             Admin
           </span>
         )}
+        {connected && isPendingAdmin && (
+          <span className="px-2 py-0.5 bg-indigo-900 text-indigo-300 border border-indigo-700 rounded text-xs font-semibold">
+            Pending Admin
+          </span>
+        )}
       </div>
 
-      {/* ── Current state ────────────────────────────────────────────────── */}
+      {/* ── Current state ─────────────────────────────────────────────────── */}
       {storeInfo && (
-        <div className="bg-gray-800 rounded-xl p-4 space-y-3">
+        <div className={`rounded-xl p-4 space-y-3 transition-colors duration-700 ${stateFlash ? 'bg-green-900/40 border border-green-700/60' : 'bg-gray-800'}`}>
           <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wide">
             Current State
+            {stateFlash && <span className="ml-2 text-green-400 font-normal normal-case">✓ updated</span>}
           </h3>
           <SolStateRow label="Admin" value={storeInfo.admin.toBase58()} />
+          {storeInfo.pendingAdmin && (
+            <SolStateRow label="Pending Admin" value={storeInfo.pendingAdmin.toBase58()} highlight />
+          )}
           <SolStateRow
             label="Developer"
             value={storeInfo.developer.toBase58()}
@@ -245,7 +295,7 @@ export default function SolanaPanel() {
       )}
 
       {/* ── Write actions ─────────────────────────────────────────────────── */}
-      {connected && (
+      {connected && isConfigured && (
         <div className="space-y-4">
           <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wide">
             Actions{' '}
@@ -256,27 +306,51 @@ export default function SolanaPanel() {
             )}
           </h3>
 
-          {/* Set Developer */}
+          <div className={`bg-gray-800 rounded-xl p-4 space-y-3 ${!isAdmin ? 'opacity-60' : ''}`}>
+            <p className="text-sm font-medium text-gray-200">Transfer Admin (two-step)</p>
+            <p className="text-xs text-gray-500">
+              Proposes a new admin. The address must call <em>Accept Admin</em> to take effect.
+              The current admin retains control until then.
+            </p>
+            <AddressInput
+              placeholder="New admin public key (base58)"
+              value={newAdminAddress}
+              onChange={setNewAdminAddress}
+            />
+            <SolActionButton onClick={handleSetAdmin} label="Transfer Admin" disabled={!isAdmin} />
+            {txStatus.card === 'admin' && <TxStatus status={txStatus} />}
+          </div>
+
+          {isPendingAdmin && (
+            <div className="bg-indigo-900/30 border border-indigo-700/50 rounded-xl p-4 space-y-3">
+              <p className="text-sm font-medium text-indigo-200">Accept Admin</p>
+              <p className="text-xs text-indigo-400">
+                Your wallet is the pending admin. Sign to complete the admin transfer.
+              </p>
+              <SolActionButton
+                onClick={handleAcceptAdmin}
+                label="Accept Admin"
+                variant="primary"
+              />
+              {txStatus.card === 'admin' && <TxStatus status={txStatus} />}
+            </div>
+          )}
+
           <div className={`bg-gray-800 rounded-xl p-4 space-y-3 ${!isAdmin ? 'opacity-60' : ''}`}>
             <p className="text-sm font-medium text-gray-200">Set Developer</p>
             <p className="text-xs text-gray-500">
-              Directly sets a new developer address. Only the admin can call this. Pass the system
-              program address (<code className="bg-gray-700 px-1 rounded">111…111</code>) to
-              remove the developer.
+              Directly sets a new developer address (admin only). Pass the system program address (
+              <code className="bg-gray-700 px-1 rounded">111…111</code>) to remove the developer.
             </p>
             <AddressInput
               placeholder="New developer public key (base58)"
               value={newDevAddress}
               onChange={setNewDevAddress}
             />
-            <SolActionButton
-              onClick={handleSetDeveloper}
-              label="Set Developer"
-              disabled={!isAdmin}
-            />
+            <SolActionButton onClick={handleSetDeveloper} label="Set Developer" disabled={!isAdmin} />
+            {txStatus.card === 'set' && <TxStatus status={txStatus} />}
           </div>
 
-          {/* Enable / Disable */}
           <div className={`bg-gray-800 rounded-xl p-4 space-y-3 ${!isAdmin ? 'opacity-60' : ''}`}>
             <p className="text-sm font-medium text-gray-200">Toggle Developer Role</p>
             <div className="flex gap-3">
@@ -293,34 +367,30 @@ export default function SolanaPanel() {
                 variant="danger"
               />
             </div>
+            {txStatus.card === 'toggle' && <TxStatus status={txStatus} />}
           </div>
         </div>
       )}
-
-      <TxStatus status={txStatus} />
     </div>
   );
 }
 
 // ── Small local components ─────────────────────────────────────────────────────
 
-function SolStateRow({
-  label,
-  value,
-  dim,
-}: {
-  label: string;
-  value: string;
-  dim?: boolean;
-}) {
+function ConfigBanner({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center gap-2 px-3 py-2 bg-gray-800 rounded-lg">
+      <span className="text-xs text-gray-500 shrink-0">{label}</span>
+      <span className="text-xs font-mono text-gray-300 break-all">{value}</span>
+    </div>
+  );
+}
+
+function SolStateRow({ label, value, dim, highlight }: { label: string; value: string; dim?: boolean; highlight?: boolean }) {
   return (
     <div className="flex items-start justify-between py-2 border-b border-gray-700 gap-4">
       <span className="text-sm text-gray-400 shrink-0">{label}</span>
-      <span
-        className={`text-sm font-mono break-all text-right ${
-          dim ? 'text-gray-600' : 'text-gray-200'
-        }`}
-      >
+      <span className={`text-sm font-mono break-all text-right ${dim ? 'text-gray-600' : highlight ? 'text-yellow-300' : 'text-gray-200'}`}>
         {value}
       </span>
     </div>
@@ -341,7 +411,7 @@ function SolActionButton({
   const colors = {
     primary: 'bg-purple-600 hover:bg-purple-700',
     success: 'bg-green-600 hover:bg-green-700',
-    danger: 'bg-red-600 hover:bg-red-700',
+    danger:  'bg-red-600 hover:bg-red-700',
   };
   return (
     <button
@@ -353,3 +423,5 @@ function SolActionButton({
     </button>
   );
 }
+
+

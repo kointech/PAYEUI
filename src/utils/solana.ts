@@ -26,10 +26,61 @@ async function disc(name: string): Promise<Uint8Array> {
 // ── SetOFTConfigParams variant indices (Rust enum order) ──────────────────────
 // Admin = 0, Delegate = 1, DefaultFee = 2, Paused = 3,
 // Pauser = 4, Unpauser = 5, Developer = 6, DeveloperEnabled = 7
+const VARIANT_ADMIN = 0;
 const VARIANT_DEVELOPER = 6;
 const VARIANT_DEVELOPER_ENABLED = 7;
 
 // ── Instruction builders ───────────────────────────────────────────────────────
+
+/**
+ * Build a `set_oft_config` instruction that proposes a new admin (two-step).
+ * Admin signs — the new admin must then call `accept_admin` to finalise.
+ */
+export async function buildSetAdminIx(
+  admin: PublicKey,
+  oftStore: PublicKey,
+  newAdmin: PublicKey,
+  programId: PublicKey,
+): Promise<TransactionInstruction> {
+  const discriminator = await disc('set_oft_config');
+
+  // Borsh layout: discriminator(8) + variant_u8(1) + pubkey(32) = 41 bytes
+  const data = new Uint8Array(41);
+  data.set(discriminator, 0);
+  data[8] = VARIANT_ADMIN;
+  data.set(newAdmin.toBytes(), 9);
+
+  return new TransactionInstruction({
+    keys: [
+      { pubkey: admin, isSigner: true, isWritable: false },
+      { pubkey: oftStore, isSigner: false, isWritable: true },
+    ],
+    programId,
+    data: Buffer.from(data),
+  });
+}
+
+/**
+ * Build an `accept_admin` instruction.
+ * Must be signed by the pending admin to complete the two-step admin transfer.
+ */
+export async function buildAcceptAdminIx(
+  pendingAdmin: PublicKey,
+  oftStore: PublicKey,
+  programId: PublicKey,
+): Promise<TransactionInstruction> {
+  const discriminator = await disc('accept_admin');
+
+  // No payload — discriminator only (8 bytes)
+  return new TransactionInstruction({
+    keys: [
+      { pubkey: pendingAdmin, isSigner: true, isWritable: false },
+      { pubkey: oftStore, isSigner: false, isWritable: true },
+    ],
+    programId,
+    data: Buffer.from(discriminator),
+  });
+}
 
 /**
  * Build a `set_oft_config` instruction that sets the developer address.
@@ -92,6 +143,7 @@ export async function buildSetDeveloperEnabledIx(
 /** Fields relevant to the Developer Admin UI. */
 export interface OFTStoreInfo {
   admin: PublicKey;
+  pendingAdmin: PublicKey | null;
   developer: PublicKey;
   developerEnabled: boolean;
 }
@@ -147,6 +199,7 @@ export function parseOFTStore(rawData: Uint8Array): OFTStoreInfo {
   // pending_admin: Option<Pubkey>
   const hasPendingAdmin = rawData[o] === 1;
   o += 1;
+  const pendingAdmin = hasPendingAdmin ? new PublicKey(rawData.slice(o, o + 32)) : null;
   if (hasPendingAdmin) o += 32;
 
   const developer = new PublicKey(rawData.slice(o, o + 32));
@@ -154,7 +207,7 @@ export function parseOFTStore(rawData: Uint8Array): OFTStoreInfo {
 
   const developerEnabled = rawData[o] === 1;
 
-  return { admin, developer, developerEnabled };
+  return { admin, pendingAdmin, developer, developerEnabled };
 }
 
 // ── Read helpers ───────────────────────────────────────────────────────────────
