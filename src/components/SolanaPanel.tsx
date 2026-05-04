@@ -6,8 +6,12 @@ import {
   fetchOFTStore,
   buildSetAdminIx,
   buildAcceptAdminIx,
+  buildSetPauseIx,
+  buildSetPauserIx,
+  buildSetUnpauserIx,
   buildSetDeveloperIx,
   buildSetDeveloperEnabledIx,
+  buildSetDelegateIx,
   OFTStoreInfo,
 } from '../utils/solana';
 import { SOLANA_CLUSTERS } from '../config/solana';
@@ -28,10 +32,13 @@ export default function SolanaPanel() {
   const [loading, setLoading] = useState(false);
   const [newAdminAddress, setNewAdminAddress] = useState('');
   const [newDevAddress, setNewDevAddress] = useState('');
+  const [newDelegateAddress, setNewDelegateAddress] = useState('');
+  const [newPauserAddress, setNewPauserAddress] = useState('');
+  const [newUnpauserAddress, setNewUnpauserAddress] = useState('');
   const [txStatus, setTxStatus] = useState<{
     state: 'idle' | 'pending' | 'success' | 'error';
     msg: string;
-    card: 'admin' | 'set' | 'toggle' | null;
+    card: 'admin' | 'set' | 'toggle' | 'delegate' | 'pause' | 'pauser' | null;
   }>({ state: 'idle', msg: '', card: null });
   const [stateFlash, setStateFlash] = useState(false);
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -87,7 +94,7 @@ export default function SolanaPanel() {
 
   async function runWrite(
     label: string,
-    card: 'admin' | 'set' | 'toggle',
+    card: 'admin' | 'set' | 'toggle' | 'delegate' | 'pause' | 'pauser',
     buildIx: () => Promise<import('@solana/web3.js').TransactionInstruction>,
   ) {
     if (!publicKey || !signTransaction) { alert('Connect your Solana wallet first.'); return; }
@@ -98,8 +105,6 @@ export default function SolanaPanel() {
       const { blockhash, lastValidBlockHeight } =
         await connection.getLatestBlockhash('confirmed');
       const tx = new Transaction({ feePayer: publicKey, blockhash, lastValidBlockHeight }).add(ix);
-      // Use signTransaction + sendRawTransaction so the app's connection (devnet/mainnet)
-      // is used for sending, rather than Phantom's internal RPC via SolanaSignAndSendTransaction.
       const signed = await signTransaction(tx);
       const sig = await connection.sendRawTransaction(signed.serialize(), { skipPreflight: false });
       setTxStatus({ state: 'pending', msg: `Confirming… (${sig.slice(0, 16)}…)`, card });
@@ -107,6 +112,8 @@ export default function SolanaPanel() {
       setTxStatus({ state: 'success', msg: `${label} confirmed. Sig: ${sig.slice(0, 16)}…`, card });
       if (card === 'set') setNewDevAddress('');
       if (card === 'admin') setNewAdminAddress('');
+      if (card === 'delegate') setNewDelegateAddress('');
+      if (card === 'pauser') { setNewPauserAddress(''); setNewUnpauserAddress(''); }
       await readState(true);
     } catch (e) {
       if (e instanceof SendTransactionError) {
@@ -172,12 +179,68 @@ export default function SolanaPanel() {
       buildSetDeveloperEnabledIx(publicKey!, getOftStore(), false, getProgramId()),
     );
 
+  async function handleSetDelegate() {
+    let newDelegate: PublicKey;
+    try { newDelegate = new PublicKey(newDelegateAddress); }
+    catch { alert('Enter a valid Solana public key.'); return; }
+    if (storeInfo?.delegate && newDelegate.equals(storeInfo.delegate)) {
+      setTxStatus({ state: 'error', msg: 'This address is already the current delegate.', card: 'delegate' });
+      return;
+    }
+    await runWrite('Set Delegate', 'delegate', () =>
+      buildSetDelegateIx(publicKey!, getOftStore(), newDelegate, getProgramId()),
+    );
+  }
+
+  const handlePause = () =>
+    runWrite('Pause', 'pause', () =>
+      buildSetPauseIx(publicKey!, getOftStore(), true, getProgramId()),
+    );
+
+  const handleUnpause = () =>
+    runWrite('Unpause', 'pause', () =>
+      buildSetPauseIx(publicKey!, getOftStore(), false, getProgramId()),
+    );
+
+  async function handleSetPauser() {
+    let pauser: PublicKey | null = null;
+    if (newPauserAddress.trim()) {
+      try { pauser = new PublicKey(newPauserAddress); }
+      catch { alert('Enter a valid Solana public key for pauser.'); return; }
+    }
+    await runWrite('Set Pauser', 'pauser', () =>
+      buildSetPauserIx(publicKey!, getOftStore(), pauser, getProgramId()),
+    );
+  }
+
+  async function handleSetUnpauser() {
+    let unpauser: PublicKey | null = null;
+    if (newUnpauserAddress.trim()) {
+      try { unpauser = new PublicKey(newUnpauserAddress); }
+      catch { alert('Enter a valid Solana public key for unpauser.'); return; }
+    }
+    await runWrite('Set Unpauser', 'pauser', () =>
+      buildSetUnpauserIx(publicKey!, getOftStore(), unpauser, getProgramId()),
+    );
+  }
+
   const isAdmin =
     !!publicKey && !!storeInfo && storeInfo.admin.toBase58() === publicKey.toBase58();
 
   const isPendingAdmin =
     !!publicKey && !!storeInfo?.pendingAdmin &&
     storeInfo.pendingAdmin.toBase58() === publicKey.toBase58();
+
+  const isPauser =
+    !!publicKey && !!storeInfo?.pauser &&
+    storeInfo.pauser.toBase58() === publicKey.toBase58();
+
+  const isUnpauser =
+    !!publicKey && !!storeInfo?.unpauser &&
+    storeInfo.unpauser.toBase58() === publicKey.toBase58();
+
+  const canPause   = isAdmin || isPauser;
+  const canUnpause = isAdmin || isUnpauser;
 
   function selectCluster(idx: number) {
     setClusterIdx(idx);
@@ -269,6 +332,16 @@ export default function SolanaPanel() {
             Pending Admin
           </span>
         )}
+        {connected && isPauser && (
+          <span className="px-2 py-0.5 bg-orange-900 text-orange-300 border border-orange-700 rounded text-xs font-semibold">
+            Pauser
+          </span>
+        )}
+        {connected && isUnpauser && (
+          <span className="px-2 py-0.5 bg-teal-900 text-teal-300 border border-teal-700 rounded text-xs font-semibold">
+            Unpauser
+          </span>
+        )}
       </div>
 
       {/* ── Current state ─────────────────────────────────────────────────── */}
@@ -282,6 +355,20 @@ export default function SolanaPanel() {
           {storeInfo.pendingAdmin && (
             <SolStateRow label="Pending Admin" value={storeInfo.pendingAdmin.toBase58()} highlight />
           )}
+          <div className="flex items-center justify-between py-2 border-b border-gray-700">
+            <span className="text-sm text-gray-400">Paused</span>
+            {storeInfo.paused ? (
+              <span className="px-2 py-0.5 bg-red-900/60 text-red-300 border border-red-700 rounded text-xs font-semibold">Paused</span>
+            ) : (
+              <span className="px-2 py-0.5 bg-green-900/60 text-green-300 border border-green-700 rounded text-xs font-semibold">Active</span>
+            )}
+          </div>
+          {storeInfo.pauser && (
+            <SolStateRow label="Pauser" value={storeInfo.pauser.toBase58()} />
+          )}
+          {storeInfo.unpauser && (
+            <SolStateRow label="Unpauser" value={storeInfo.unpauser.toBase58()} />
+          )}
           <SolStateRow
             label="Developer"
             value={storeInfo.developer.toBase58()}
@@ -291,6 +378,11 @@ export default function SolanaPanel() {
             <span className="text-sm text-gray-400">Developer Enabled</span>
             <StatusBadge enabled={storeInfo.developerEnabled} />
           </div>
+          <SolStateRow
+            label="LZ Delegate"
+            value={storeInfo.delegate?.toBase58() ?? '—'}
+            dim={!storeInfo.delegate}
+          />
         </div>
       )}
 
@@ -299,12 +391,63 @@ export default function SolanaPanel() {
         <div className="space-y-4">
           <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wide">
             Actions{' '}
-            {!isAdmin && (
+            {!isAdmin && !canPause && !canUnpause && (
               <span className="text-yellow-500 normal-case font-normal">
                 (requires Admin wallet)
               </span>
             )}
           </h3>
+
+          {/* ── Pause / Unpause ──────────────────────────────────────────── */}
+          {(canPause || canUnpause) && (
+            <div className={`rounded-xl p-4 space-y-3 border ${
+              storeInfo?.paused
+                ? 'bg-red-900/20 border-red-700/50'
+                : 'bg-gray-800 border-transparent'
+            }`}>
+              <p className="text-sm font-medium text-gray-200">Emergency Pause</p>
+              <p className="text-xs text-gray-500">
+                Halts all OFT transfers. Pause requires the <em>pauser</em> key (or admin if no
+                pauser is set); unpause requires the <em>unpauser</em> key (or admin).
+              </p>
+              <div className="flex gap-3">
+                <SolActionButton
+                  onClick={handlePause}
+                  label="Pause"
+                  disabled={!canPause || (storeInfo?.paused ?? false)}
+                  variant="danger"
+                />
+                <SolActionButton
+                  onClick={handleUnpause}
+                  label="Unpause"
+                  disabled={!canUnpause || !(storeInfo?.paused ?? false)}
+                  variant="success"
+                />
+              </div>
+              {txStatus.card === 'pause' && <TxStatus status={txStatus} />}
+            </div>
+          )}
+
+          <div className={`bg-gray-800 rounded-xl p-4 space-y-3 ${!isAdmin ? 'opacity-60' : ''}`}>
+            <p className="text-sm font-medium text-gray-200">Set Pauser / Unpauser</p>
+            <p className="text-xs text-gray-500">
+              Designate which keys can pause and unpause. Leave blank to clear (falls back to
+              admin). Admin only.
+            </p>
+            <AddressInput
+              placeholder="Pauser public key (base58, blank to clear)"
+              value={newPauserAddress}
+              onChange={setNewPauserAddress}
+            />
+            <SolActionButton onClick={handleSetPauser} label="Set Pauser" disabled={!isAdmin} />
+            <AddressInput
+              placeholder="Unpauser public key (base58, blank to clear)"
+              value={newUnpauserAddress}
+              onChange={setNewUnpauserAddress}
+            />
+            <SolActionButton onClick={handleSetUnpauser} label="Set Unpauser" disabled={!isAdmin} />
+            {txStatus.card === 'pauser' && <TxStatus status={txStatus} />}
+          </div>
 
           <div className={`bg-gray-800 rounded-xl p-4 space-y-3 ${!isAdmin ? 'opacity-60' : ''}`}>
             <p className="text-sm font-medium text-gray-200">Transfer Admin (two-step)</p>
@@ -368,6 +511,31 @@ export default function SolanaPanel() {
               />
             </div>
             {txStatus.card === 'toggle' && <TxStatus status={txStatus} />}
+          </div>
+
+          <div className={`bg-gray-800 rounded-xl p-4 space-y-3 ${!isAdmin ? 'opacity-60' : ''}`}>
+            <p className="text-sm font-medium text-gray-200">Set LZ Delegate</p>
+            <p className="text-xs text-gray-500">
+              Updates the LayerZero endpoint delegate — the key allowed to call{' '}
+              <code className="bg-gray-700 px-1 rounded">initSendLibrary</code>,{' '}
+              <code className="bg-gray-700 px-1 rounded">initReceiveLibrary</code>, and{' '}
+              <code className="bg-gray-700 px-1 rounded">setOappConfig</code> on the LZ endpoint.
+              Set this to the developer key so the developer can configure peers without
+              needing the admin key again.
+            </p>
+            {storeInfo?.delegate && (
+              <p className="text-xs text-gray-500">
+                Current delegate:{' '}
+                <span className="font-mono text-gray-300">{storeInfo.delegate.toBase58()}</span>
+              </p>
+            )}
+            <AddressInput
+              placeholder="New delegate public key (base58)"
+              value={newDelegateAddress}
+              onChange={setNewDelegateAddress}
+            />
+            <SolActionButton onClick={handleSetDelegate} label="Set Delegate" disabled={!isAdmin} />
+            {txStatus.card === 'delegate' && <TxStatus status={txStatus} />}
           </div>
         </div>
       )}
